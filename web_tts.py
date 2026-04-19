@@ -4,29 +4,29 @@ import edge_tts
 import srt
 import os
 from pydub import AudioSegment
+from pydub.effects import speedup
 import io
 import time
 
 # --- 1. CẤU HÌNH GIAO DIỆN CHUYÊN NGHIỆP ---
-st.set_page_config(page_title="AI TTS Pro Dashboard", layout="wide", page_icon="🎙️")
+st.set_page_config(page_title="AI TTS Pro - Auto Timing", layout="wide", page_icon="🎙️")
 
 st.markdown("""
     <style>
-    .stApp { background-color: #f8fafc; }
-    /* Voice Card Style */
-    .voice-card {
-        padding: 10px; border-radius: 8px; background-color: #ffffff;
-        border: 1px solid #e2e8f0; margin-bottom: 8px; transition: all 0.2s;
-    }
-    .selected-voice { border: 2px solid #3b82f6; background-color: #eff6ff; }
-    /* Khung nhập liệu: Nền trắng, Chữ đen rõ ràng */
+    .stApp { background-color: #0e1117; }
+    /* Khung nhập liệu: Nền trắng, Chữ đen */
     .stTextArea textarea { 
         font-size: 16px !important; color: #000000 !important; 
-        background-color: #ffffff !important; border: 1px solid #cbd5e1;
+        background-color: #ffffff !important; border-radius: 10px;
     }
-    .credit-badge {
-        padding: 5px 12px; border-radius: 15px; background: #3b82f6;
-        color: white; font-weight: bold; font-size: 14px; margin-bottom: 15px;
+    .voice-card {
+        padding: 10px; border-radius: 8px; background-color: #1e293b;
+        border: 1px solid #334155; margin-bottom: 8px; color: white;
+    }
+    .selected-voice { border: 2px solid #22c55e; background-color: #064e3b; }
+    .stButton>button { 
+        width: 100%; border-radius: 10px; font-weight: bold; height: 3.5em; 
+        background: linear-gradient(45deg, #22c55e, #10b981); color: white; border: none;
     }
     </style>
 """, unsafe_allow_html=True)
@@ -46,17 +46,15 @@ async def run_tts_with_retry(text, voice_code, retries=3):
                 if chunk["type"] == "audio":
                     audio_data += chunk["data"]
             if audio_data: return audio_data
-        except Exception:
+        except:
             if attempt < retries - 1:
-                time.sleep(1.5 * (attempt + 1)) # Nghỉ tăng dần nếu bị chặn
+                time.sleep(1)
                 continue
     return None
 
-# --- 4. SIDEBAR (BỘ LỌC) ---
+# --- 4. SIDEBAR SETTINGS ---
 with st.sidebar:
-    st.markdown("### ⚙️ Settings")
-    st.markdown('<div class="credit-badge">💎 Credits: 5,000</div>', unsafe_allow_html=True)
-    
+    st.markdown("### ⚙️ Cấu hình")
     @st.cache_data
     def get_all_voices():
         async def fetch(): return await edge_tts.list_voices()
@@ -66,22 +64,22 @@ with st.sidebar:
     locales = sorted(list(set([v['Locale'] for v in voices])))
     lang_filter = st.selectbox("🌐 Ngôn ngữ:", locales, index=locales.index("vi-VN") if "vi-VN" in locales else 0)
     gender_filter = st.radio("👤 Giới tính:", ["All", "Male", "Female"], horizontal=True)
-    search_q = st.text_input("🔍 Tìm tên giọng:", placeholder="VD: HoaiMy...")
+    
+    st.divider()
+    st.markdown("💎 **Credits: 5,000**")
 
 # --- 5. GIAO DIỆN CHÍNH ---
 col_in, col_vo = st.columns([1.8, 1.2])
 
 with col_in:
-    st.markdown("### 📝 Nội dung kịch bản")
-    input_text = st.text_area("Hỗ trợ Văn bản hoặc SRT (Màu chữ đen rõ ràng):", height=400, placeholder="Dán nội dung phim...")
-    # ĐỊNH NGHĨA NÚT BẤM (Fix lỗi NameError)
-    process_btn = st.button("🚀 BẮT ĐẦU CHUYỂN ĐỔI (TRỪ CREDIT)", type="primary", use_container_width=True)
+    st.markdown("### 📝 Kịch bản (Hỗ trợ SRT)")
+    input_text = st.text_area("Dán nội dung vào đây (Chữ đen rõ ràng):", height=400)
+    process_btn = st.button("🚀 BẮT ĐẦU LỒNG TIẾNG", type="primary", use_container_width=True)
 
 with col_vo:
-    st.markdown("### 🎙️ Chọn Giọng Đọc")
+    st.markdown("### 🎙️ Danh sách giọng")
     v_list = [v for v in voices if v['Locale'] == lang_filter]
     if gender_filter != "All": v_list = [v for v in v_list if v['Gender'] == gender_filter]
-    if search_q: v_list = [v for v in v_list if search_q.lower() in v['ShortName'].lower()]
 
     voice_container = st.container(height=380)
     with voice_container:
@@ -91,46 +89,60 @@ with col_vo:
                 st.session_state.selected_voice = v['ShortName']
                 st.rerun()
 
-# --- 6. XỬ LÝ KHI NHẤN NÚT ---
+# --- 6. LOGIC XỬ LÝ VÀ CĂN CHỈNH TỐC ĐỘ ---
 if process_btn:
     if not input_text:
         st.error("Vui lòng nhập kịch bản!")
     else:
-        with st.status("🔮 Đang xử lý âm thanh chất lượng cao...", expanded=True) as status:
+        with st.status("🔮 Đang xử lý âm thanh và khớp thời gian...", expanded=True) as status:
             try:
                 is_srt = " --> " in input_text
                 voice = st.session_state.selected_voice
                 
                 if not is_srt:
-                    # Chế độ văn bản
+                    # Chế độ văn bản thường
                     res = asyncio.run(run_tts_with_retry(input_text, voice))
                     if res:
                         st.audio(res, format="audio/mp3")
-                        st.download_button("📥 Tải MP3", res, file_name="ai_voice.mp3")
                 else:
-                    # Chế độ SRT chuẩn
+                    # CHẾ ĐỘ SRT - CĂN CHỈNH TỐC ĐỘ (AUTO-TIMING)
                     subs = list(srt.parse(input_text))
-                    total_ms = int(subs[-1].end.total_seconds() * 1000) + 2000
+                    total_ms = int(subs[-1].end.total_seconds() * 1000) + 1000
                     final_audio = AudioSegment.silent(duration=total_ms)
                     
                     prog = st.progress(0)
                     for i, sub in enumerate(subs):
-                        # Xử lý từng dòng với Retry
                         chunk = asyncio.run(run_tts_with_retry(sub.content, voice))
                         if chunk:
+                            # 1. Load âm thanh AI vừa tạo
                             seg = AudioSegment.from_file(io.BytesIO(chunk), format="mp3")
+                            
+                            # 2. Tính toán thời gian cho phép trong SRT
+                            duration_allowed_ms = (sub.end - sub.start).total_seconds() * 1000
+                            actual_duration_ms = len(seg)
+                            
+                            # 3. NẾU NÓI DÀI HƠN SUB: Tự động tăng tốc độ
+                            if actual_duration_ms > duration_allowed_ms:
+                                factor = actual_duration_ms / duration_allowed_ms
+                                # Giới hạn speedup tối đa 2.0 để không bị quá méo tiếng
+                                factor = min(factor, 2.0)
+                                seg = speedup(seg, playback_speed=factor)
+                                # Cắt bỏ phần thừa nếu vẫn còn dài hơn (để tuyệt đối không đè câu sau)
+                                seg = seg[:duration_allowed_ms]
+                            
+                            # 4. Đặt vào đúng vị trí bắt đầu
                             start_ms = int(sub.start.total_seconds() * 1000)
                             final_audio = final_audio.overlay(seg, position=start_ms)
                         
                         prog.progress((i + 1) / len(subs))
-                        time.sleep(0.4) # Độ trễ an toàn chống 503
+                        time.sleep(0.1) # Độ trễ nhẹ tránh lỗi 503
                     
-                    # Xuất kết quả
+                    # Xuất kết quả cuối
                     buf = io.BytesIO()
                     final_audio.export(buf, format="mp3")
                     st.audio(buf.getvalue())
-                    st.download_button("📥 Tải Audio hoàn chỉnh", buf.getvalue(), file_name="dub_final.mp3")
+                    st.download_button("📥 Tải file hoàn chỉnh (Đã khớp thời gian)", buf.getvalue(), file_name="final_sync.mp3")
 
-                status.update(label="✅ Đã xử lý xong!", state="complete")
+                status.update(label="✅ Đã khớp thời gian thành công!", state="complete")
             except Exception as e:
-                st.error(f"Lỗi hệ thống: {str(e)}")
+                st.error(f"Lỗi: {str(e)}")
