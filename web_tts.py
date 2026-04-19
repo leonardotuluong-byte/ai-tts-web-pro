@@ -2,16 +2,16 @@ import streamlit as st
 import asyncio
 import edge_tts
 import srt
-import tempfile
 import os
 from pydub import AudioSegment
 import io
+import time
 
-# CẤU HÌNH GIAO DIỆN CHUẨN (KHÔNG DÙNG STATIC_FFMPEG)
-st.set_page_config(page_title="AI TTS Web Pro", layout="wide")
+# CẤU HÌNH GIAO DIỆN
+st.set_page_config(page_title="AI TTS Web Pro - Fixed", layout="wide")
 
 st.title("🎙️ HỆ THỐNG LỒNG TIẾNG ĐA NĂNG (BẢN WEB)")
-st.info("Phiên bản đã tối ưu hóa, dứt điểm lỗi nhảy cửa sổ và lỗi thư viện.")
+st.info("Phiên bản sửa lỗi 503 Throttling và lỗi nhận diện âm thanh.")
 
 # --- KHU VỰC NHẬP LIỆU ---
 col1, col2 = st.columns([2, 1])
@@ -29,7 +29,9 @@ with col2:
     try:
         all_voices = get_voices_sync()
         countries = sorted(list(set([v['Locale'] for v in all_voices])))
-        sel_country = st.selectbox("Quốc gia:", ["Tất cả"] + countries, index=countries.index("vi-VN") + 1 if "vi-VN" in countries else 0)
+        # Mặc định chọn Việt Nam
+        default_index = countries.index("vi-VN") + 1 if "vi-VN" in countries else 0
+        sel_country = st.selectbox("Quốc gia:", ["Tất cả"] + countries, index=default_index)
         
         genders = ["Tất cả", "Male", "Female"]
         sel_gender = st.selectbox("Giới tính:", genders)
@@ -47,46 +49,66 @@ with col2:
             sel_voice_code = sel_voice_str.split(" ")[1]
         else:
             st.warning("Không tìm thấy giọng phù hợp.")
+            sel_voice_code = None
     except Exception as e:
         st.error(f"Lỗi tải danh sách giọng: {e}")
+
+# --- HÀM XỬ LÝ TTS CHO TỪNG ĐOẠN ---
+async def text_to_speech_bytes(text, voice):
+    if not text.strip():
+        return None
+    try:
+        communicate = edge_tts.Communicate(text, voice)
+        audio_data = b""
+        async for chunk in communicate.stream():
+            if chunk["type"] == "audio":
+                audio_data += chunk["data"]
+        return audio_data
+    except Exception as e:
+        return None
 
 # --- XỬ LÝ LỒNG TIẾNG ---
 if st.button("🚀 BẮT ĐẦU TẠO ÂM THANH", type="primary", use_container_width=True):
     if not input_text:
         st.error("Vui lòng nhập nội dung văn bản hoặc SRT!")
+    elif not sel_voice_code:
+        st.error("Vui lòng chọn giọng đọc!")
     else:
         with st.status("Đang xử lý âm thanh... vui lòng chờ...", expanded=True) as status:
             try:
                 is_srt = " --> " in input_text
                 
                 if not is_srt:
-                    # Dịch văn bản thường
-                    communicate = edge_tts.Communicate(input_text, sel_voice_code)
-                    with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as tmp:
-                        asyncio.run(communicate.save(tmp.name))
-                        with open(tmp.name, "rb") as f:
-                            audio_bytes = f.read()
+                    # Xử lý văn bản thường
+                    audio_bytes = asyncio.run(text_to_speech_bytes(input_text, sel_voice_code))
+                    if audio_bytes:
                         st.audio(audio_bytes, format="audio/mp3")
                         st.download_button("📥 Tải file MP3", audio_bytes, file_name="AI_Voice.mp3")
-                    os.remove(tmp.name)
                 else:
-                    # Dịch file SRT
+                    # Xử lý file SRT
                     subs = list(srt.parse(input_text))
-                    total_duration_ms = int(subs[-1].end.total_seconds() * 1000) + 2000
+                    # Tính tổng thời lượng (ms)
+                    total_duration_ms = int(subs[-1].end.total_seconds() * 1000) + 1000
                     final_audio = AudioSegment.silent(duration=total_duration_ms)
                     
                     progress_bar = st.progress(0)
+                    
                     for i, sub in enumerate(subs):
-                        comm = edge_tts.Communicate(sub.content, sel_voice_code)
-                        with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as tmp_chunk:
-                            asyncio.run(comm.save(tmp_chunk.name))
-                            segment = AudioSegment.from_file(tmp_chunk.name, format="mp3")
-                            os.remove(tmp_chunk.name)
+                        # Chống lỗi 503 bằng cách nghỉ nhẹ 0.1s mỗi câu
+                        time.sleep(0.1) 
                         
-                        start_pos = int(sub.start.total_seconds() * 1000)
-                        final_audio = final_audio.overlay(segment, position=start_pos)
+                        audio_data = asyncio.run(text_to_speech_bytes(sub.content, sel_voice_code))
+                        
+                        if audio_data:
+                            # Chuyển bytes sang segment audio
+                            segment = AudioSegment.from_file(io.BytesIO(audio_data), format="mp3")
+                            start_pos = int(sub.start.total_seconds() * 1000)
+                            # Đè âm thanh vào đúng vị trí thời gian
+                            final_audio = final_audio.overlay(segment, position=start_pos)
+                        
                         progress_bar.progress((i + 1) / len(subs))
                     
+                    # Xuất kết quả cuối cùng
                     buffer = io.BytesIO()
                     final_audio.export(buffer, format="mp3")
                     st.audio(buffer.getvalue(), format="audio/mp3")
@@ -94,4 +116,4 @@ if st.button("🚀 BẮT ĐẦU TẠO ÂM THANH", type="primary", use_container_
 
                 status.update(label="✅ Đã xử lý xong!", state="complete")
             except Exception as e:
-                st.error(f"Lỗi: {e}")
+                st.error(f"Lỗi hệ thống: {e}")
