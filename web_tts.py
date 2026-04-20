@@ -36,38 +36,48 @@ if 'selected_voice' not in st.session_state:
     st.session_state.selected_voice = "vi-VN-HoaiMyNeural"
 
 # =========================================================================
-# SỬA LỖI CRASH: TẠO HÀM CHẠY ASYNC TRONG LUỒNG ĐỘC LẬP (THREADING)
+# SỬA LỖI CRASH 100%: Thiết kế lại hàm Threading với asyncio.run()
 # =========================================================================
-def run_async_safe(coro):
-    result = None
-    exception = None
+def run_async_safe(func, *args, **kwargs):
+    result = [None]
+    exception = [None]
 
     def thread_target():
-        nonlocal result, exception
         try:
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            result = loop.run_until_complete(coro)
+            # Dành cho Windows: Chống lỗi Event Loop Policy của aiohttp
+            if os.name == 'nt':
+                asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+            # Sử dụng asyncio.run() để Python TỰ ĐỘNG mở/đóng loop và dọn dẹp rác
+            result[0] = asyncio.run(func(*args, **kwargs))
         except Exception as e:
-            exception = e
-        finally:
-            loop.close()
+            exception[0] = e
 
     t = threading.Thread(target=thread_target)
     t.start()
     t.join()
     
-    if exception:
-        raise exception
-    return result
+    if exception[0]:
+        raise exception[0]
+    return result[0]
 
 # --- 3. HÀM HỖ TRỢ XỬ LÝ ÂM THANH MƯỢT ---
 def trim_audio_silence(audio_segment):
     """Cắt bỏ khoảng lặng 'rác' ở đầu và cuối do AI tạo ra"""
-    start_trim = silence.detect_leading_silence(audio_segment, silence_threshold=-50.0)
-    end_trim = silence.detect_leading_silence(audio_segment.reverse(), silence_threshold=-50.0)
-    duration = len(audio_segment)
-    return audio_segment[start_trim:duration-end_trim]
+    # CHỐNG SẬP: Bỏ qua nếu file âm thanh bị lỗi quá ngắn
+    if len(audio_segment) < 100: 
+        return audio_segment
+        
+    try:
+        start_trim = silence.detect_leading_silence(audio_segment, silence_threshold=-50.0)
+        end_trim = silence.detect_leading_silence(audio_segment.reverse(), silence_threshold=-50.0)
+        
+        # CHỐNG SẬP: Không cắt nếu khoảng lặng dài hơn toàn bộ audio
+        if start_trim + end_trim >= len(audio_segment):
+            return audio_segment
+            
+        return audio_segment[start_trim:len(audio_segment)-end_trim]
+    except:
+        return audio_segment
 
 async def run_tts_with_retry(text, voice_code, retries=3):
     if not text.strip(): return None
@@ -91,8 +101,8 @@ with st.sidebar:
     
     @st.cache_data
     def get_all_voices():
-        async def fetch(): return await edge_tts.list_voices()
-        return run_async_safe(fetch())
+        # Gọi thẳng hàm list_voices qua hệ thống cách ly
+        return run_async_safe(edge_tts.list_voices)
 
     try:
         voices = get_all_voices()
@@ -139,12 +149,13 @@ if process_btn:
                 voice = st.session_state.selected_voice
                 
                 if not is_srt:
-                    res = run_async_safe(run_tts_with_retry(input_text, voice))
+                    # GỌI HÀM AN TOÀN ĐÃ CẬP NHẬT CẤU TRÚC
+                    res = run_async_safe(run_tts_with_retry, input_text, voice)
                     
                     if res:
                         # CHỐNG RÈ: Chuẩn hóa âm lượng và set cứng tần số mẫu
                         seg = AudioSegment.from_file(io.BytesIO(res), format="mp3")
-                        seg = seg.set_frame_rate(44100).set_channels(1)
+                        seg = seg.set_frame_rate(44100).set_channels(1).set_sample_width(2)
                         seg = normalize(seg)
                         
                         buf = io.BytesIO()
@@ -164,23 +175,28 @@ if process_btn:
                     total_ms = int(subs[-1].end.total_seconds() * 1000) + 2000
                     
                     # CHỐNG RÈ: Ép file nền tĩnh chuẩn 44.1kHz để tránh lệch pha sóng âm
-                    final_audio = AudioSegment.silent(duration=total_ms, frame_rate=44100).set_channels(1)
+                    final_audio = AudioSegment.silent(duration=total_ms, frame_rate=44100).set_channels(1).set_sample_width(2)
                     
                     last_end_ms = 0  
                     prog = st.progress(0)
                     
                     for i, sub in enumerate(subs):
-                        chunk = run_async_safe(run_tts_with_retry(sub.content, voice))
+                        # GỌI HÀM AN TOÀN ĐÃ CẬP NHẬT CẤU TRÚC
+                        chunk = run_async_safe(run_tts_with_retry, sub.content, voice)
                         
                         if chunk:
                             seg = AudioSegment.from_file(io.BytesIO(chunk), format="mp3")
                             
                             # CHỐNG RÈ: Đồng bộ tần số mẫu của từng mảnh nhỏ với nền
-                            seg = seg.set_frame_rate(44100).set_channels(1)
+                            seg = seg.set_frame_rate(44100).set_channels(1).set_sample_width(2)
                             seg = trim_audio_silence(seg)
                             
                             srt_start_ms = int(sub.start.total_seconds() * 1000)
                             duration_allowed_ms = (sub.end - sub.start).total_seconds() * 1000
+                            
+                            # CHỐNG SẬP: Không cho phép chia cho 0 nếu thời gian lỗi
+                            if duration_allowed_ms <= 0:
+                                duration_allowed_ms = 100 
                             
                             prev_text = subs[i-1].content.strip() if i > 0 else "."
                             is_continuous = not any(prev_text.endswith(p) for p in ['.', '!', '?', '。', '！', '？', ';', ':'])
@@ -193,8 +209,9 @@ if process_btn:
                             actual_duration_ms = len(seg)
                             if actual_duration_ms > duration_allowed_ms:
                                 factor = actual_duration_ms / duration_allowed_ms
-                                # CHỐNG RÈ KIM LOẠI: Thêm chunk_size và crossfade vào hàm speedup
-                                seg = speedup(seg, playback_speed=min(factor, 2.0), chunk_size=30, crossfade=15)
+                                if factor > 1.0:
+                                    # CHỐNG RÈ KIM LOẠI: Thêm chunk_size và crossfade vào hàm speedup
+                                    seg = speedup(seg, playback_speed=min(factor, 2.0), chunk_size=30, crossfade=15)
                                 seg = seg[:int(duration_allowed_ms)] 
                             
                             # CHỐNG NỔ PỤP: Fade mượt 15ms ở cả 2 đầu âm thanh
