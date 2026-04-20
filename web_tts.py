@@ -7,6 +7,7 @@ from pydub import AudioSegment, silence
 from pydub.effects import speedup
 import io
 import time
+import threading
 
 # --- 1. CẤU HÌNH GIAO DIỆN CHUYÊN NGHIỆP ---
 st.set_page_config(page_title="AI TTS Pro - Smooth Storytelling", layout="wide", page_icon="🎙️")
@@ -34,14 +35,34 @@ st.markdown("""
 if 'selected_voice' not in st.session_state:
     st.session_state.selected_voice = "vi-VN-HoaiMyNeural"
 
-# SỬA LỖI CRASH: TẠO HÀM CHẠY ASYNC AN TOÀN CHO STREAMLIT
-def run_async(coro):
-    try:
-        loop = asyncio.get_event_loop()
-    except RuntimeError:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-    return loop.run_until_complete(coro)
+# =========================================================================
+# SỬA LỖI CRASH: TẠO HÀM CHẠY ASYNC TRONG LUỒNG ĐỘC LẬP (THREADING)
+# Đảm bảo tuyệt đối không bao giờ bị lỗi "Event loop is already running"
+# =========================================================================
+def run_async_safe(coro):
+    result = None
+    exception = None
+
+    def thread_target():
+        nonlocal result, exception
+        try:
+            # Tạo một môi trường hoàn toàn mới và sạch sẽ cho AI chạy
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            result = loop.run_until_complete(coro)
+        except Exception as e:
+            exception = e
+        finally:
+            loop.close()
+
+    # Chạy môi trường đó ở một luồng riêng
+    t = threading.Thread(target=thread_target)
+    t.start()
+    t.join()
+    
+    if exception:
+        raise exception
+    return result
 
 # --- 3. HÀM HỖ TRỢ XỬ LÝ ÂM THANH MƯỢT ---
 def trim_audio_silence(audio_segment):
@@ -70,15 +91,21 @@ async def run_tts_with_retry(text, voice_code, retries=3):
 # --- 4. SIDEBAR SETTINGS ---
 with st.sidebar:
     st.markdown("### ⚙️ Cấu hình")
+    
     @st.cache_data
     def get_all_voices():
         async def fetch(): return await edge_tts.list_voices()
-        return run_async(fetch())
+        # Dùng hàm an toàn để lấy danh sách giọng
+        return run_async_safe(fetch())
 
-    voices = get_all_voices()
-    locales = sorted(list(set([v['Locale'] for v in voices])))
-    lang_filter = st.selectbox("🌐 Ngôn ngữ:", locales, index=locales.index("vi-VN") if "vi-VN" in locales else 0)
-    gender_filter = st.radio("👤 Giới tính:", ["All", "Male", "Female"], horizontal=True)
+    try:
+        voices = get_all_voices()
+        locales = sorted(list(set([v['Locale'] for v in voices])))
+        lang_filter = st.selectbox("🌐 Ngôn ngữ:", locales, index=locales.index("vi-VN") if "vi-VN" in locales else 0)
+        gender_filter = st.radio("👤 Giới tính:", ["All", "Male", "Female"], horizontal=True)
+    except Exception as e:
+        st.error(f"Không thể kết nối máy chủ giọng nói. Lỗi: {e}")
+        voices = []
     
     st.divider()
     st.markdown("💎 **Credits: 5,000**")
@@ -93,16 +120,17 @@ with col_in:
 
 with col_vo:
     st.markdown("### 🎙️ Danh sách giọng")
-    v_list = [v for v in voices if v['Locale'] == lang_filter]
-    if gender_filter != "All": v_list = [v for v in v_list if v['Gender'] == gender_filter]
+    if voices:
+        v_list = [v for v in voices if v['Locale'] == lang_filter]
+        if gender_filter != "All": v_list = [v for v in v_list if v['Gender'] == gender_filter]
 
-    voice_container = st.container(height=380)
-    with voice_container:
-        for v in v_list:
-            is_sel = st.session_state.selected_voice == v['ShortName']
-            if st.button(f"{'✅' if is_sel else '👤'} {v['ShortName'].split('-')[-1]}", key=v['ShortName'], use_container_width=True):
-                st.session_state.selected_voice = v['ShortName']
-                st.rerun()
+        voice_container = st.container(height=380)
+        with voice_container:
+            for v in v_list:
+                is_sel = st.session_state.selected_voice == v['ShortName']
+                if st.button(f"{'✅' if is_sel else '👤'} {v['ShortName'].split('-')[-1]}", key=v['ShortName'], use_container_width=True):
+                    st.session_state.selected_voice = v['ShortName']
+                    st.rerun()
 
 # --- 6. LOGIC XỬ LÝ VÀ CĂN CHỈNH TỐC ĐỘ MƯỢT ---
 if process_btn:
@@ -114,16 +142,12 @@ if process_btn:
                 is_srt = " --> " in input_text
                 voice = st.session_state.selected_voice
                 
-                # SỬA LỖI CRASH: Khởi tạo luồng xử lý đồng bộ 1 lần duy nhất
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
-                
                 if not is_srt:
-                    # Chế độ văn bản thường
-                    res = loop.run_until_complete(run_tts_with_retry(input_text, voice))
+                    # DÙNG HÀM AN TOÀN CHO ĐOẠN VĂN BẢN THƯỜNG
+                    res = run_async_safe(run_tts_with_retry(input_text, voice))
+                    
                     if res:
                         st.audio(res, format="audio/mp3")
-                        # SỬA LỖI ĐỊNH DẠNG: Đã thêm mime="audio/mpeg" và nút tải cho văn bản thường
                         st.download_button(
                             label="📥 Tải file hoàn chỉnh (.mp3)", 
                             data=res, 
@@ -132,7 +156,7 @@ if process_btn:
                             use_container_width=True
                         )
                 else:
-                    # CHẾ ĐỘ SRT - XỬ LÝ NỐI CÂU MƯỢT
+                    # DÙNG HÀM AN TOÀN CHO TỪNG CÂU TRONG FILE SRT
                     subs = list(srt.parse(input_text))
                     total_ms = int(subs[-1].end.total_seconds() * 1000) + 2000
                     final_audio = AudioSegment.silent(duration=total_ms)
@@ -141,7 +165,9 @@ if process_btn:
                     prog = st.progress(0)
                     
                     for i, sub in enumerate(subs):
-                        chunk = loop.run_until_complete(run_tts_with_retry(sub.content, voice))
+                        # Gọi hàm chạy an toàn (không bị đụng độ luồng)
+                        chunk = run_async_safe(run_tts_with_retry(sub.content, voice))
+                        
                         if chunk:
                             seg = AudioSegment.from_file(io.BytesIO(chunk), format="mp3")
                             seg = trim_audio_silence(seg)
@@ -167,15 +193,11 @@ if process_btn:
                             last_end_ms = current_start + len(seg)
                         
                         prog.progress((i + 1) / len(subs))
-                        time.sleep(0.05)
-                    
-                    loop.close() # Đóng luồng an toàn
                     
                     buf = io.BytesIO()
                     final_audio.export(buf, format="mp3")
                     st.audio(buf.getvalue(), format="audio/mp3")
                     
-                    # SỬA LỖI ĐỊNH DẠNG: Bổ sung mime="audio/mpeg" giúp trình duyệt nhận diện file MP3
                     st.download_button(
                         label="📥 Tải file hoàn chỉnh (Đã xử lý mượt)", 
                         data=buf.getvalue(), 
@@ -186,4 +208,4 @@ if process_btn:
 
                 status.update(label="✅ Đã xử lý mượt và khớp thời gian!", state="complete")
             except Exception as e:
-                st.error(f"Lỗi: {str(e)}")
+                st.error(f"Lỗi hệ thống: {str(e)}")
