@@ -14,7 +14,6 @@ st.set_page_config(page_title="AI TTS Pro - Smooth Storytelling", layout="wide",
 st.markdown("""
     <style>
     .stApp { background-color: #0e1117; }
-    /* Khung nhập liệu: Nền trắng, Chữ đen */
     .stTextArea textarea { 
         font-size: 16px !important; color: #000000 !important; 
         background-color: #ffffff !important; border-radius: 10px;
@@ -35,6 +34,15 @@ st.markdown("""
 if 'selected_voice' not in st.session_state:
     st.session_state.selected_voice = "vi-VN-HoaiMyNeural"
 
+# SỬA LỖI CRASH: TẠO HÀM CHẠY ASYNC AN TOÀN CHO STREAMLIT
+def run_async(coro):
+    try:
+        loop = asyncio.get_event_loop()
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+    return loop.run_until_complete(coro)
+
 # --- 3. HÀM HỖ TRỢ XỬ LÝ ÂM THANH MƯỢT ---
 def trim_audio_silence(audio_segment):
     """Cắt bỏ khoảng lặng 'rác' ở đầu và cuối do AI tạo ra"""
@@ -53,7 +61,7 @@ async def run_tts_with_retry(text, voice_code, retries=3):
                 if chunk["type"] == "audio":
                     audio_data += chunk["data"]
             if audio_data: return audio_data
-        except:
+        except Exception as e:
             if attempt < retries - 1:
                 time.sleep(1)
                 continue
@@ -65,7 +73,7 @@ with st.sidebar:
     @st.cache_data
     def get_all_voices():
         async def fetch(): return await edge_tts.list_voices()
-        return asyncio.run(fetch())
+        return run_async(fetch())
 
     voices = get_all_voices()
     locales = sorted(list(set([v['Locale'] for v in voices])))
@@ -106,62 +114,75 @@ if process_btn:
                 is_srt = " --> " in input_text
                 voice = st.session_state.selected_voice
                 
+                # SỬA LỖI CRASH: Khởi tạo luồng xử lý đồng bộ 1 lần duy nhất
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                
                 if not is_srt:
                     # Chế độ văn bản thường
-                    res = asyncio.run(run_tts_with_retry(input_text, voice))
+                    res = loop.run_until_complete(run_tts_with_retry(input_text, voice))
                     if res:
                         st.audio(res, format="audio/mp3")
+                        # SỬA LỖI ĐỊNH DẠNG: Đã thêm mime="audio/mpeg" và nút tải cho văn bản thường
+                        st.download_button(
+                            label="📥 Tải file hoàn chỉnh (.mp3)", 
+                            data=res, 
+                            file_name="audio_thuong.mp3", 
+                            mime="audio/mpeg",
+                            use_container_width=True
+                        )
                 else:
                     # CHẾ ĐỘ SRT - XỬ LÝ NỐI CÂU MƯỢT
                     subs = list(srt.parse(input_text))
                     total_ms = int(subs[-1].end.total_seconds() * 1000) + 2000
                     final_audio = AudioSegment.silent(duration=total_ms)
                     
-                    last_end_ms = 0  # Theo dõi mốc kết thúc thực tế của câu trước
+                    last_end_ms = 0  
                     prog = st.progress(0)
                     
                     for i, sub in enumerate(subs):
-                        chunk = asyncio.run(run_tts_with_retry(sub.content, voice))
+                        chunk = loop.run_until_complete(run_tts_with_retry(sub.content, voice))
                         if chunk:
-                            # 1. Load âm thanh và CẮT KHOẢNG LẶNG ĐẦU/CUỐI
                             seg = AudioSegment.from_file(io.BytesIO(chunk), format="mp3")
                             seg = trim_audio_silence(seg)
                             
-                            # 2. Xác định vị trí bắt đầu
                             srt_start_ms = int(sub.start.total_seconds() * 1000)
                             duration_allowed_ms = (sub.end - sub.start).total_seconds() * 1000
                             
-                            # Logic nối câu: Nếu câu trước không kết thúc bằng dấu câu, nối sát vào đuôi
                             prev_text = subs[i-1].content.strip() if i > 0 else "."
                             is_continuous = not any(prev_text.endswith(p) for p in ['.', '!', '?', '。', '！', '？', ';', ':'])
                             
                             if is_continuous and last_end_ms > 0:
-                                # Nối sát (gối đầu 30ms để xóa vết cắt)
                                 current_start = max(srt_start_ms, last_end_ms - 30)
                             else:
                                 current_start = srt_start_ms
 
-                            # 3. Tính toán lại tốc độ nếu đoạn nối vượt quá giới hạn SRT
                             actual_duration_ms = len(seg)
                             if actual_duration_ms > duration_allowed_ms:
                                 factor = actual_duration_ms / duration_allowed_ms
                                 seg = speedup(seg, playback_speed=min(factor, 2.0))
-                                seg = seg[:duration_allowed_ms] # Cắt cứng để không đè dòng sau
+                                seg = seg[:int(duration_allowed_ms)] 
                             
-                            # 4. Ghi đè vào file tổng
                             final_audio = final_audio.overlay(seg, position=current_start)
-                            
-                            # Cập nhật mốc kết thúc để câu sau tham chiếu
                             last_end_ms = current_start + len(seg)
                         
                         prog.progress((i + 1) / len(subs))
                         time.sleep(0.05)
                     
-                    # Xuất kết quả cuối
+                    loop.close() # Đóng luồng an toàn
+                    
                     buf = io.BytesIO()
                     final_audio.export(buf, format="mp3")
-                    st.audio(buf.getvalue())
-                    st.download_button("📥 Tải file hoàn chỉnh (Đã xử lý mượt)", buf.getvalue(), file_name="final_smooth_sync.mp3")
+                    st.audio(buf.getvalue(), format="audio/mp3")
+                    
+                    # SỬA LỖI ĐỊNH DẠNG: Bổ sung mime="audio/mpeg" giúp trình duyệt nhận diện file MP3
+                    st.download_button(
+                        label="📥 Tải file hoàn chỉnh (Đã xử lý mượt)", 
+                        data=buf.getvalue(), 
+                        file_name="final_smooth_sync.mp3", 
+                        mime="audio/mpeg",
+                        use_container_width=True
+                    )
 
                 status.update(label="✅ Đã xử lý mượt và khớp thời gian!", state="complete")
             except Exception as e:
