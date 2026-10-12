@@ -73,10 +73,8 @@ def run_async_safe(func, *args, **kwargs):
 
 # --- 3. HÀM HỖ TRỢ XỬ LÝ ÂM THANH MƯỢT ---
 def trim_audio_silence(audio_segment):
-  """Cắt bỏ khoảng lặng 'rác' ở đầu và cuối do AI tạo ra"""
   if len(audio_segment) < 100:
     return audio_segment
-
   try:
     start_trim = silence.detect_leading_silence(
         audio_segment, silence_threshold=-50.0
@@ -84,10 +82,8 @@ def trim_audio_silence(audio_segment):
     end_trim = silence.detect_leading_silence(
         audio_segment.reverse(), silence_threshold=-50.0
     )
-
     if start_trim + end_trim >= len(audio_segment):
       return audio_segment
-
     return audio_segment[start_trim : len(audio_segment) - end_trim]
   except:
     return audio_segment
@@ -126,7 +122,9 @@ with st.sidebar:
     lang_filter = st.selectbox(
         "🌐 Ngôn ngữ:",
         locales,
-        index=locales.index("vi-VN") if "vi-VN" in locales else 0,
+        index=locales.index("es-US")
+        if "es-US" in locales
+        else (locales.index("vi-VN") if "vi-VN" in locales else 0),
     )
     gender_filter = st.radio(
         "👤 Giới tính:", ["All", "Male", "Female"], horizontal=True
@@ -174,7 +172,6 @@ if process_btn:
   if not input_text:
     st.error("Vui lòng nhập kịch bản!")
   else:
-    # Reset dữ liệu cũ trước khi xử lý
     st.session_state.audio_data = None
     with st.status(
         "🔮 Đang xử lý âm thanh mượt và khớp thời gian...", expanded=True
@@ -184,16 +181,50 @@ if process_btn:
         voice = st.session_state.selected_voice
 
         if not is_srt:
-          res = run_async_safe(run_tts_with_retry, input_text, voice)
-          if res:
-            seg = AudioSegment.from_file(io.BytesIO(res), format="mp3")
-            seg = seg.set_frame_rate(44100).set_channels(1).set_sample_width(2)
-            seg = normalize(seg)
+          # Xử lý văn bản thường: Chia nhỏ thành từng câu để tránh quá tải server
+          paragraphs = [p.strip() for p in input_text.split("\n") if p.strip()]
+          if not paragraphs:
+            paragraphs = [input_text]
 
+          combined_audio = AudioSegment.silent(
+              duration=0, frame_rate=44100
+          ).set_channels(1).set_sample_width(2)
+
+          for para in paragraphs:
+            sentences = [s.strip() for s in para.split(".") if s.strip()]
+            if not sentences:
+              sentences = [para]
+            for sentence in sentences:
+              if not sentence:
+                continue
+              full_sentence = (
+                  sentence
+                  if sentence.endswith((".", "!", "?"))
+                  else sentence + "."
+              )
+              res = run_async_safe(
+                  run_tts_with_retry, full_sentence, voice
+              )
+              if res:
+                seg = AudioSegment.from_file(io.BytesIO(res), format="mp3")
+                seg = (
+                    seg.set_frame_rate(44100)
+                    .set_channels(1)
+                    .set_sample_width(2)
+                )
+                seg = normalize(seg)
+                combined_audio += seg + AudioSegment.silent(
+                    duration=250, frame_rate=44100
+                )
+              time.sleep(0.1)
+
+          if len(combined_audio) > 0:
+            combined_audio = normalize(combined_audio)
             buf = io.BytesIO()
-            seg.export(buf, format="mp3", bitrate="192k")
+            combined_audio.export(buf, format="mp3", bitrate="192k")
             st.session_state.audio_data = buf.getvalue()
         else:
+          # Xử lý file SRT chuẩn
           subs = list(srt.parse(input_text))
           total_ms = int(subs[-1].end.total_seconds() * 1000) + 2000
 
@@ -263,7 +294,7 @@ if process_btn:
       except Exception as e:
         st.error(f"Lỗi hệ thống: {str(e)}")
 
-# --- 7. HIỂN THỊ KHU VỰC NGHE VÀ TẢI FILE ÂM THANH BÊN NGOÀI ST.STATUS ---
+# --- 7. HIỂN THỊ KHU VỰC NGHE VÀ TẢI FILE ÂM THANH ---
 if st.session_state.audio_data is not None:
   st.divider()
   st.markdown("### 🎵 Kết quả âm thanh hoàn chỉnh")
